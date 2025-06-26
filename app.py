@@ -43,6 +43,24 @@ DESCENT_TW  = 0.5
 WAIT_T      = 0.2
 SRATE       = 10_000
 
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+def safe_weighted_corr(x: np.ndarray, y: np.ndarray, w: np.ndarray | None = None):
+    """
+    Weighted Pearson R that returns np.nan (not a warning) when either
+    variable is constant.  If w is None an un-weighted R is returned.
+    """
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    if w is None:
+        w = np.ones_like(x)
+    m_x, m_y = np.average(x, weights=w), np.average(y, weights=w)
+    v_x = np.average((x - m_x) ** 2, weights=w)
+    v_y = np.average((y - m_y) ** 2, weights=w)
+    if v_x == 0 or v_y == 0:
+        return np.nan            # << avoids divide-by-zero
+    cov = np.average((x - m_x) * (y - m_y), weights=w)
+    return cov / np.sqrt(v_x * v_y)
 
 def identify_and_remove_noise(x, interpolate=False):
     """Return (list_of_index_pairs, cleaned_array)."""
@@ -162,14 +180,18 @@ disp_df["Artifact Clean"] = clean_arr
 
 tab_over, tab_time, tab_corr, tab_rms, tab_poly, tab_avg, \
 tab_art, tab_clean, tab_peaks, tab_nopeaks, tab_bladj, \
-tab_filt, tab_msna, tab_bp, tab_baro, tab_cd = st.tabs(
+tab_filt, tab_msna, tab_bp, tab_baro, tab_cd, tab_neural, \
+tab_neural_cmp, tab_mecharc, tab_mecharc_sel = st.tabs(
     ["Overview", "Time series", "Correlation",
      "RMS Int SNA", "Poly Baseline", "Corrected Avg",
      "Artifacts", "Cleaned Artifacts", "Burst Detection",
      "No-Peaks", "BL-Adjusted", "Filtered Peaks",
      "MSNA Quantification", "BP Variability Bins",
-     "Baroreflex Slope",                       
-     "Carotid Diameter Troughs"]               
+     "Baroreflex Slope",
+     "Carotid Diameter Troughs",
+     "Neural Arc (C diameter)", "Neural Arc – Orig vs Sel",
+     "Mechanical Arc",                  
+     "Mechanical Arc (Sel)"]            
 )
 
 
@@ -614,6 +636,8 @@ with tab_filt:
         height=240,
     )
 
+    st.session_state["filt_idx"] = filt_idx
+
 # 13 MSNA Quantification & Excel export --------------------------------------
 with tab_msna:
     st.markdown("## Muscle Sympathetic Nerve Activity (MSNA) metrics")
@@ -712,6 +736,7 @@ with tab_msna:
             bin_cnt = st.session_state.get("bin_counts")
             baro = st.session_state.get("baro_df")
             diam = st.session_state.get("diam_stats")      
+            neural = st.session_state.get("neural_arc_df")
             if baro is not None:
                 baro.to_excel(xlw, sheet_name="Baroreflex", index=False)
             if bp_met is not None:
@@ -728,7 +753,35 @@ with tab_msna:
                 diam["sel_stats"].to_excel(xlw, sheet_name="Selected Diameter", index=False)
                 start_row = len(diam["sel_stats"]) + 2
                 diam["sel_bins"].to_excel(xlw, sheet_name="Selected Diameter",
-                                        index=False, startrow=start_row)    
+                                        index=False, startrow=start_row)
+            if neural is not None:
+                neural.to_excel(xlw, sheet_name="Neural Arc", index=False)
+
+            neural_cmp = st.session_state.get("neural_cmp_df")
+            if neural_cmp is not None:
+                neural_cmp.to_excel(xlw, sheet_name="Neural Arc (Comp)", index=False)
+            neural_orig = st.session_state.get("neural_arm_orig")
+            neural_sel  = st.session_state.get("neural_arm_sel")
+            if neural_orig is not None:
+                neural_orig.to_excel(xlw,
+                                     sheet_name="Neural Arm Original",
+                                     index=False)
+            if neural_sel is not None:
+                neural_sel.to_excel(xlw,
+                                    sheet_name="Neural Arm Selected",
+                                    index=False)
+            mech_arc = st.session_state.get("mech_arc_df")
+            if mech_arc is not None:
+                mech_arc.to_excel(xlw, sheet_name="Mechanical Arc", index=False)
+            mech_comp_orig = st.session_state.get("mech_arc_df")
+            mech_comp_sel  = st.session_state.get("mech_arc_sel_df")
+            if mech_comp_orig is not None:
+                mech_comp_orig.to_excel(
+                    xlw, sheet_name="Mechanical Component Original", index=False)
+            if mech_comp_sel is not None:
+                mech_comp_sel.to_excel(
+                    xlw, sheet_name="Mechanical Component Selected", index=False)
+
         file_name += ".xlsx"
         mime_type  = (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -818,6 +871,8 @@ with tab_msna:
     fig4.update_layout(height=900, template="plotly_white",
                        showlegend=False, margin=dict(r=110))
     st.plotly_chart(fig4, use_container_width=True)
+
+    st.session_state["peaks_ecg"] = peaks_ecg
 
 # 14 ───────────────────────────  BP variability tab  ─────────────────────────
 with tab_bp:
@@ -1025,14 +1080,27 @@ with tab_baro:
         pred  = model.predict(bin_mid_select.reshape(-1, 1))
 
         # weighted R & R²
-        mx = np.average(bin_mid_select, weights=wts_select)
-        my = np.average(inc_select,   weights=wts_select)
-        cov  = np.sum(wts_select * (bin_mid_select - mx) * (inc_select - my)) / wts_select.sum()
-        stdx = np.sqrt(np.sum(wts_select * (bin_mid_select - mx) ** 2) / wts_select.sum())
-        stdy = np.sqrt(np.sum(wts_select * (inc_select   - my) ** 2) / wts_select.sum())
-        r_val = cov / (stdx * stdy)
-        r_sq  = r_val ** 2
+        # mx = np.average(bin_mid_select, weights=wts_select)
+        # my = np.average(inc_select,   weights=wts_select)
+        # cov  = np.sum(wts_select * (bin_mid_select - mx) * (inc_select - my)) / wts_select.sum()
+        # stdx = np.sqrt(np.sum(wts_select * (bin_mid_select - mx) ** 2) / wts_select.sum())
+        # stdy = np.sqrt(np.sum(wts_select * (inc_select   - my) ** 2) / wts_select.sum())
+        r_val = safe_weighted_corr(bin_mid_select, inc_select, wts_select)
+        r_sq  = r_val ** 2 if not np.isnan(r_val) else np.nan
 
+        # r_val = cov / (stdx * stdy)
+        # r_sq  = r_val ** 2
+
+        df_neural_sel = pd.DataFrame({
+                "Diastolic Carotid Diameter Bins": x_sel,
+                "MSNA Incidence (Bursts/100 Heartbeats)": y_sel,
+                "Total Heartbeats in Bin": wts,
+                "Slope":   [slope]   + [""] * (len(x_sel) - 1),
+                "Weighted Correlation Coefficient (R)": [r] + [""] * (len(x_sel) - 1),
+                "Coefficient of Determination (R²)":    [r2] + [""] * (len(x_sel) - 1),
+            })
+        st.session_state["neural_arm_sel"] = df_neural_sel  
+        
         # KPIs
         k1, k2, k3 = st.columns(3)
         k1.metric("Slope (bursts/100 HB per mmHg)", f"{slope:.4f}")
@@ -1072,7 +1140,7 @@ with tab_baro:
                         "R²":[r_sq]})],
             ignore_index=True
         )
-
+    
 # ───────────────────────  CAROTID DIAMETER TROUGHS tab  ──────────────────────
     with tab_cd:
         st.markdown("## Carotid diameter – trough detection & cleaning")
@@ -1114,6 +1182,18 @@ with tab_baro:
                             yaxis_title="Diameter (a.u.)", xaxis_range=[0, 150])
         st.plotly_chart(fig_cd, use_container_width=True)
 
+        # --- FULL table of detected troughs  ----------------------------------
+        st.markdown("### Detected-trough table")
+        st.dataframe(                                  # ← new line
+            pd.DataFrame({                             #  build the table
+                "No.":       np.arange(1, len(troughs_cd)+1),
+                "Sample idx":troughs_cd,
+                "Time (s)":  t_arr[troughs_cd],
+                "Diameter":  diam_sig[troughs_cd]
+            }).style.format({"Time (s)":"{:.2f}", "Diameter":"{:.4f}"}),
+            height=300, use_container_width=True
+        )
+
         # --- helper: statistics & bin counts ----------------------------------
         def _diam_stats(label, idx):
             vals = diam_sig[idx] if label.startswith("Selected") else diam_sig
@@ -1127,7 +1207,9 @@ with tab_baro:
                             label:[mean, sd, cv, vals.min(), vals.max(), len(vals)]}).set_index("Metric"),
                 bin_counts[bin_counts>0]     # drop zero bars
             )
-
+        st.session_state["troughs_original"] = troughs_cd      # all detected troughs
+        st.session_state["troughs_selected"] = troughs_keep    # user-kept troughs    
+        
         stats_orig, bins_orig   = _diam_stats("Original", troughs_cd)
         stats_sel,  bins_sel    = _diam_stats("Selected", troughs_keep)
 
@@ -1163,3 +1245,443 @@ with tab_baro:
             "sel_stats":   stats_sel.reset_index(),
             "sel_bins":    bins_sel.reset_index().rename(columns={"index":"Diameter bin",0:"Heart-beats"})
         }
+
+# ── 2 ▸ Neural-Arc TAB (cleaned)  ────────────────────────────────────────
+with tab_neural:
+    st.markdown("## Neural arc – MSNA incidence vs. diastolic **carotid diameter**")
+
+    # ---- prerequisites ---------------------------------------------------
+    diam = df["Ultrasound - Diameter"].values
+
+    # data coming from other tabs ↓↓↓
+    peaks_ecg_arr = st.session_state.get("peaks_ecg")
+    msna_bursts   = st.session_state.get("filt_idx")
+    trough_idx    = st.session_state.get("carotid_trough_idx")
+
+    if peaks_ecg_arr is None or msna_bursts is None:
+        st.warning("Visit the **Filtered Peaks** and **MSNA** tabs once, "
+                   "so the app can detect bursts and R-waves.")
+        st.stop()
+
+    if trough_idx is None or len(trough_idx) < 3:
+        st.warning("No carotid-diameter troughs available – run the "
+                   "**Carotid Diameter Troughs** tab first.")
+        st.stop()
+
+    # ---- helper: nearest preceding trough --------------------------------
+    def _prev(idx, troughs):
+        troughs = np.asarray(troughs)
+        pos = np.searchsorted(troughs, idx, side="right") - 1
+        return troughs[max(pos, 0)]                 # ← protects against −1
+
+    # ---- diameter bins ---------------------------------------------------
+    step   = 0.2
+    edges  = np.arange(diam.min(), diam.max() + step, step)
+    labels = [f"{edges[i]:.1f}-{edges[i+1]:.1f}" for i in range(len(edges)-1)]
+
+    hb_trough   = diam[_prev(peaks_ecg_arr, trough_idx)]
+    msna_trough = diam[_prev(msna_bursts,   trough_idx)]
+
+    hb_bins   = pd.cut(hb_trough,   bins=edges, labels=labels, include_lowest=True)
+    msna_bins = pd.cut(msna_trough, bins=edges, labels=labels, include_lowest=True)
+
+    hb_counts   = hb_bins.value_counts().reindex(labels, fill_value=0)
+    msna_counts = msna_bins.value_counts().reindex(labels, fill_value=0)
+
+    # remove sparse bins (≤2 HB)
+    valid_mask = hb_counts > 2
+    inc        = (msna_counts / hb_counts.replace(0, np.nan) * 100).replace([np.inf, np.nan], 0)
+
+    x_mid = np.array([(float(l.split('-')[0]) + float(l.split('-')[1])) / 2 for l in labels])
+    x_sel, y_sel, wts = x_mid[valid_mask], inc[valid_mask].values, hb_counts[valid_mask].values
+
+    if len(x_sel) < 2:
+        st.warning("Fewer than two diameter bins with >2 heart-beats – regression skipped.")
+        st.stop()
+
+    # ---- weighted regression --------------------------------------------
+    mdl   = LinearRegression().fit(x_sel.reshape(-1, 1), y_sel, sample_weight=wts)
+    slope = float(mdl.coef_[0])
+    pred  = mdl.predict(x_sel.reshape(-1, 1))
+
+    # weighted correlation
+    mx, my = np.average(x_sel, weights=wts), np.average(y_sel, weights=wts)
+    cov    = np.sum(wts * (x_sel - mx) * (y_sel - my)) / wts.sum()
+    # weighted correlation
+    r  = safe_weighted_corr(x_sel, y_sel, wts)
+    r2 = r ** 2 if not np.isnan(r) else np.nan
+    # r      = cov / (np.sqrt(np.sum(wts * (x_sel - mx) ** 2) / wts.sum())
+    #                * np.sqrt(np.sum(wts * (y_sel - my) ** 2) / wts.sum()))
+    # r2     = r ** 2
+
+    # ---- KPIs ------------------------------------------------------------
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Slope (bursts/100 HB · mm⁻¹)", f"{slope:.4f}")
+    c2.metric("Weighted R", f"{r:.4f}")
+    c3.metric("R²",         f"{r2:.4f}")
+
+    # ---- plot ------------------------------------------------------------
+    fig = go.Figure()
+    fig.add_scatter(x=x_sel, y=y_sel, mode="markers",
+                    marker=dict(color="navy", size=7), name="Incidence")
+    fig.add_scatter(x=x_sel, y=pred, mode="lines",
+                    line=dict(color="navy", dash="dash"), name="Weighted fit")
+    fig.update_layout(template="plotly_white",
+                      title="Neural-arc slope (diameter bins)",
+                      xaxis_title="Diastolic carotid diameter (mm, bin midpoint)",
+                      yaxis_title="MSNA incidence (bursts / 100 HB)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---- incidence table & export payload --------------------------------
+    res_df = pd.DataFrame({
+        "Diameter bin": labels,
+        "Heart-beats": hb_counts.values,
+        "MSNA bursts": msna_counts.values,
+        "Incidence":   inc.values
+    })
+    st.subheader("Incidence table (all bins)")
+    st.dataframe(res_df.style.format({"Incidence": "{:.2f}"}), height=320)
+
+    st.session_state["neural_arc_df"] = pd.concat(
+        [res_df,
+         pd.DataFrame({"Diameter bin": ["— OVERALL —"],
+                       "Heart-beats":  [hb_counts.sum()],
+                       "MSNA bursts":  [msna_counts.sum()],
+                       "Incidence":    [inc[valid_mask].mean()],
+                       "Slope":        [slope],
+                       "Weighted R":   [r],
+                       "R²":           [r2]})],
+        ignore_index=True
+    )
+
+# ─────────────────────  Neural-Arc  ➜  Original VS Selected  ───────────────
+with tab_neural_cmp:
+    st.markdown("## Neural arc – *original* vs *selected* carotid troughs")
+
+    # ---- pull data produced by other tabs --------------------------------
+    peaks_ecg_arr   = st.session_state.get("peaks_ecg")
+    msna_bursts     = st.session_state.get("filt_idx")
+    troughs_orig    = st.session_state.get("troughs_original")
+    troughs_sel     = st.session_state.get("troughs_selected")
+
+    # guard-clauses (same style you use elsewhere)
+    if None in (peaks_ecg_arr, msna_bursts, troughs_orig, troughs_sel):
+        st.info("Make sure **Filtered Peaks**, **MSNA** and **Carotid Diameter "
+                "Troughs** tabs have been visited once.")
+        st.stop()
+
+    if len(troughs_sel) < 3:
+        st.warning("The *selected* trough set contains fewer than three points – "
+                   "analysis skipped.")
+        st.stop()
+
+    # ---- helper ----------------------------------------------------------
+    def _prev(event_idx, trough_idx):
+        trough_idx = np.asarray(trough_idx)
+        pos = np.searchsorted(trough_idx, event_idx, side="right") - 1
+        return trough_idx[max(pos, 0)]
+
+    diam = df["Ultrasound - Diameter"].values
+    step = 0.2
+    edges  = np.arange(diam.min(), diam.max() + step, step)
+    labels = [f"{edges[i]:.1f}-{edges[i+1]:.1f}" for i in range(len(edges)-1)]
+    midpts = np.array([(edges[i] + edges[i+1]) / 2 for i in range(len(edges)-1)])
+
+    def _incidence(troughs):
+        hb = diam[_prev(peaks_ecg_arr, troughs)]
+        sb = diam[_prev(msna_bursts,     troughs)]
+        hb_bins = pd.cut(hb, bins=edges, labels=labels, include_lowest=True)
+        sb_bins = pd.cut(sb, bins=edges, labels=labels, include_lowest=True)
+        hb_cnt  = hb_bins.value_counts().reindex(labels, fill_value=0)
+        sb_cnt  = sb_bins.value_counts().reindex(labels, fill_value=0)
+        inc     = (sb_cnt / hb_cnt.replace(0, np.nan) * 100).replace([np.inf, np.nan], 0)
+        return hb_cnt, inc
+
+    hb_o, inc_o = _incidence(troughs_orig)
+    hb_s, inc_s = _incidence(troughs_sel)
+
+    # keep bins with >2 HB (orig) and >3 HB (sel) to match the standalone script
+    msk_o = hb_o > 2
+    msk_s = hb_s > 3
+
+    x_o, y_o, w_o = midpts[msk_o], inc_o[msk_o].values, hb_o[msk_o].values
+    x_s, y_s, w_s = midpts[msk_s], inc_s[msk_s].values, hb_s[msk_s].values
+
+    # ---- regressions -----------------------------------------------------
+    mdl_o = LinearRegression().fit(x_o.reshape(-1,1), y_o, sample_weight=w_o)
+    mdl_s = LinearRegression().fit(x_s.reshape(-1,1), y_s, sample_weight=w_s)
+
+    slope_o, slope_s = float(mdl_o.coef_[0]), float(mdl_s.coef_[0])
+    r_o = safe_weighted_corr(x_o, y_o)  
+    r2_o = r_o**2
+    r_s = safe_weighted_corr(x_s, y_s)
+    r2_s = r_s**2
+
+    # ---- Excel-ready dataframe for ORIGINAL set -------------------
+    df_neural_orig = pd.DataFrame({
+        "Diastolic Carotid Diameter Bins": x_o,
+        "MSNA Incidence (Bursts/100 Heartbeats)": y_o,
+        "Total Heartbeats in Bin": w_o,
+        "Slope":   [slope_o] + [""] * (len(x_o) - 1),
+        "Weighted Correlation Coefficient (R)": [r_o] + [""] * (len(x_o) - 1),
+        "Coefficient of Determination (R²)":    [r2_o] + [""] * (len(x_o) - 1),
+    })
+    st.session_state["neural_arm_orig"] = df_neural_orig
+
+    # ---- KPI row ---------------------------------------------------------
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Slope orig", f"{slope_o:.4f}")
+    k2.metric("R orig",     f"{r_o:.4f}")
+    k3.metric("Slope sel",  f"{slope_s:.4f}")
+    k4.metric("R sel",      f"{r_s:.4f}")
+
+    # ---- plot ------------------------------------------------------------
+    fig = go.Figure()
+    fig.add_scatter(x=x_o, y=y_o, mode="markers",
+                    marker=dict(color="steelblue", size=7), name="Original")
+    fig.add_scatter(x=x_o, y=mdl_o.predict(x_o.reshape(-1,1)),
+                    mode="lines", line=dict(color="steelblue", dash="dash"),
+                    name="Orig fit")
+    fig.add_scatter(x=x_s, y=y_s, mode="markers",
+                    marker=dict(color="firebrick", size=7), name="Selected")
+    fig.add_scatter(x=x_s, y=mdl_s.predict(x_s.reshape(-1,1)),
+                    mode="lines", line=dict(color="firebrick", dash="dash"),
+                    name="Sel fit")
+    fig.update_layout(template="plotly_white",
+                      xaxis_title="Diastolic carotid diameter (mm, bin midpoint)",
+                      yaxis_title="MSNA incidence (bursts / 100 HB)",
+                      title="Neural-Arc: Original vs Selected troughs")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---- excluded diameters list ----------------------------------------
+    excl_idx = set(troughs_orig) - set(troughs_sel)
+    excl_diam = diam[list(excl_idx)]
+    if len(excl_diam):
+        st.markdown("### Excluded diameters")
+        st.write(pd.Series(excl_diam).to_frame("Diameter").style.format("{:.4f}"))
+
+    # ---- results table & export payload ----------------------------------
+    df_cmp = pd.DataFrame({
+        "Bin": labels,
+        "HB orig": hb_o.values,
+        "Inc orig": inc_o.values,
+        "HB sel":  hb_s.values,
+        "Inc sel": inc_s.values
+    })
+    st.subheader("Incidence table (all bins)")
+    st.dataframe(df_cmp.style.format({"Inc orig":"{:.2f}", "Inc sel":"{:.2f}"}),
+                 height=340)
+
+    # store for Excel export
+    st.session_state["neural_cmp_df"] = pd.concat(
+        [df_cmp,
+         pd.DataFrame({"Bin":["— OVERALL —"],
+                       "HB orig":[hb_o.sum()],
+                       "Inc orig":[inc_o[msk_o].mean()],
+                       "HB sel":[hb_s.sum()],
+                       "Inc sel":[inc_s[msk_s].mean()],
+                       "Slope orig":[slope_o], "R orig":[r_o], "R² orig":[r2_o],
+                       "Slope sel":[slope_s], "R sel":[r_s], "R² sel":[r2_s]})],
+        ignore_index=True
+    )
+# ────────────────────  MECHANICAL ARC tab  ────────────────────────────────
+with tab_mecharc:
+    st.markdown("## Mechanical arc – mean carotid diameter vs. diastolic pressure")
+
+    # prerequisites --------------------------------------------------------
+    peaks_ecg_arr = st.session_state.get("peaks_ecg")
+    if peaks_ecg_arr is None or len(peaks_ecg_arr) < 3:
+        st.info("Visit the **MSNA** tab once so R-waves are detected first.")
+        st.stop()
+
+    fp  = df["Finger Pressure"].values
+    cd  = df["Ultrasound - Diameter"].values
+
+    # 1. diastolic pressure per cardiac cycle -----------------------------
+    dia_p = np.array(
+        [fp[peaks_ecg_arr[i]:peaks_ecg_arr[i + 1]].min()
+         for i in range(len(peaks_ecg_arr) - 1)],
+        dtype=float
+    )
+    diam_at_r = cd[peaks_ecg_arr[:-1]]          # carotid diameter at R-wave
+    total_hb  = len(peaks_ecg_arr)
+
+    # 2. 3-mmHg bins -------------------------------------------------------
+    bin_edges  = np.arange(dia_p.min(), dia_p.max() + 3, 3)
+    bin_labels = [f"{round(b,1)}–{round(b+3,1)}" for b in bin_edges[:-1]]
+
+    df_mech = pd.DataFrame({
+        "Diastolic_Pressure":  dia_p,
+        "Carotid_Diameter":    diam_at_r
+    })
+    df_mech["Pressure_Bin"] = pd.cut(df_mech["Diastolic_Pressure"],
+                                     bins=bin_edges, labels=bin_labels,
+                                     include_lowest=True)
+
+    mean_diam = df_mech.groupby("Pressure_Bin")["Carotid_Diameter"]\
+                       .mean().reindex(bin_labels)
+    hb_counts = df_mech["Pressure_Bin"].value_counts()\
+                                      .reindex(bin_labels, fill_value=0)
+
+    valid = hb_counts > 3              # > 3 heart-beats, as requested
+    if valid.sum() < 2:
+        st.warning("Fewer than two pressure bins contain > 3 beats – regression skipped.")
+        st.stop()
+
+    x_mid   = np.array([(float(l.split('-')[0]) + float(l.split('-')[1])) / 2
+                        for l in mean_diam.index])[valid]
+    y_mean  = mean_diam[valid].values
+    wts     = hb_counts[valid].values
+
+    # 3. weighted regression ----------------------------------------------
+    mdl = LinearRegression().fit(x_mid.reshape(-1, 1), y_mean, sample_weight=wts)
+    slope, intercept = float(mdl.coef_[0]), float(mdl.intercept_)
+    r     = safe_weighted_corr(x_mid, y_mean, wts)
+    r2    = r**2 if not np.isnan(r) else np.nan
+    y_hat = mdl.predict(x_mid.reshape(-1, 1))
+
+    # 4. KPIs --------------------------------------------------------------
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total HB",              f"{total_hb}")
+    k2.metric("Slope (mm ⁻¹)",         f"{slope:.4f}")
+    k3.metric("Weighted R",            f"{r:.4f}")
+    k4.metric("R²",                    f"{r2:.4f}")
+
+    # 5. scatter + fit -----------------------------------------------------
+    fig_mech = go.Figure()
+    fig_mech.add_scatter(x=x_mid, y=y_mean, mode="markers",
+                         marker=dict(color="darkgreen", size=wts),
+                         name="Mean diameter / bin")
+    fig_mech.add_scatter(x=x_mid, y=y_hat, mode="lines",
+                         line=dict(color="darkgreen", dash="dash"),
+                         name="Weighted fit")
+    fig_mech.update_layout(template="plotly_white",
+                           title="Mechanical component of the carotid baroreflex",
+                           xaxis_title="Diastolic pressure (bin midpoint, mmHg)",
+                           yaxis_title="Mean carotid diameter (mm)")
+    st.plotly_chart(fig_mech, use_container_width=True)
+
+    # 6. results table -----------------------------------------------------
+    mech_df = pd.DataFrame({
+        "Pressure Bin":       mean_diam.index,
+        "Mean Diameter (mm)": mean_diam.values,
+        "Heart-beats":        hb_counts.values
+    })
+    st.subheader("Per-bin summary")
+    st.dataframe(mech_df.style.format({"Mean Diameter (mm)": "{:.3f}"}), height=280)
+
+    # 7. store Excel-ready dataframe --------------------------------------
+    mech_export = pd.DataFrame({
+        "Diastolic Pressure Bin": x_mid,
+        "Mean Carotid Diameter":  y_mean,
+        "Total Heartbeats in Bin": wts,
+        "Slope":        [slope] + [""] * (len(x_mid) - 1),
+        "Intercept":    [intercept] + [""] * (len(x_mid) - 1),
+        "Weighted Correlation Coefficient (R)": [r] + [""] * (len(x_mid) - 1),
+        "Coefficient of Determination (R²)":    [r2] + [""] * (len(x_mid) - 1),
+    })
+    st.session_state["mech_arc_df"] = mech_export
+
+# ───────────────────  MECHANICAL ARC  ➜  *SELECTED* troughs  ──────────────────
+with tab_mecharc_sel:
+    st.markdown("## Mechanical arc – **selected** carotid troughs")
+
+    # prerequisites --------------------------------------------------------
+    peaks_ecg_arr   = st.session_state.get("peaks_ecg")
+    troughs_sel     = st.session_state.get("troughs_selected")   # from Carotid tab
+
+    if peaks_ecg_arr is None or troughs_sel is None or len(troughs_sel) < 4:
+        st.info("Make sure the **MSNA** and **Carotid Diameter Troughs** tabs "
+                "have been visited and that ≥ 4 troughs are selected.")
+        st.stop()
+
+    fp, cd = df["Finger Pressure"].values, df["Ultrasound - Diameter"].values
+
+    # helper – nearest preceding R-wave for each trough --------------------
+    troughs_sel = np.asarray(troughs_sel, dtype=int)
+    precedente  = np.searchsorted(peaks_ecg_arr, troughs_sel, side="right") - 1
+    r_idx_for_trough = peaks_ecg_arr[precedente]
+
+    # diastolic pressure between consecutive R-waves -----------------------
+    dia_p_sel = np.array(
+        [fp[r_idx_for_trough[i]: r_idx_for_trough[i+1]].min()
+         if i+1 < len(r_idx_for_trough) else fp[r_idx_for_trough[i]:].min()
+         for i in range(len(r_idx_for_trough))],
+        dtype=float
+    )
+    dia_diam  = cd[troughs_sel]
+    total_sel = len(troughs_sel)
+
+    # 3-mmHg bins ----------------------------------------------------------
+    bin_edges  = np.arange(dia_p_sel.min(), dia_p_sel.max() + 3, 3)
+    bin_labels = [f"{round(b,1)}–{round(b+3,1)}" for b in bin_edges[:-1]]
+
+    df_sel = pd.DataFrame({
+        "DiaP": dia_p_sel,
+        "DiaDiam": dia_diam
+    })
+    df_sel["Bin"] = pd.cut(df_sel["DiaP"], bins=bin_edges,
+                           labels=bin_labels, include_lowest=True)
+
+    mean_diam = df_sel.groupby("Bin")["DiaDiam"].mean().reindex(bin_labels)
+    n_trough  = df_sel["Bin"].value_counts().reindex(bin_labels, fill_value=0)
+
+    valid = n_trough > 3              # > 3 troughs rule
+    if valid.sum() < 2:
+        st.warning("Fewer than two pressure bins contain > 3 selected troughs – "
+                   "regression skipped.")
+        st.stop()
+
+    x_mid = np.array([(float(l.split('-')[0]) + float(l.split('-')[1]))/2
+                      for l in mean_diam.index])[valid]
+    y_mid = mean_diam[valid].values
+    wts   = n_trough[valid].values
+
+    # weighted regression --------------------------------------------------
+    mdl = LinearRegression().fit(x_mid.reshape(-1,1), y_mid, sample_weight=wts)
+    slope_s, intercept_s = float(mdl.coef_[0]), float(mdl.intercept_)
+    r_s  = safe_weighted_corr(x_mid, y_mid, wts)
+    r2_s = r_s**2 if not np.isnan(r_s) else np.nan
+    y_hat = mdl.predict(x_mid.reshape(-1,1))
+
+    # KPIs -----------------------------------------------------------------
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Selected troughs",     f"{total_sel}")
+    c2.metric("Slope (mm ⁻¹)",        f"{slope_s:.4f}")
+    c3.metric("Weighted R",           f"{r_s:.4f}")
+    c4.metric("R²",                   f"{r2_s:.4f}")
+
+    # plot -----------------------------------------------------------------
+    fig_ms = go.Figure()
+    fig_ms.add_scatter(x=x_mid, y=y_mid, mode="markers",
+                       marker=dict(color="firebrick", size=wts),
+                       name="Mean diameter / bin")
+    fig_ms.add_scatter(x=x_mid, y=y_hat, mode="lines",
+                       line=dict(color="firebrick", dash="dash"),
+                       name="Weighted fit")
+    fig_ms.update_layout(template="plotly_white",
+                         title="Mechanical baroreflex – selected troughs",
+                         xaxis_title="Diastolic pressure (bin midpoint, mmHg)",
+                         yaxis_title="Mean carotid diameter (mm)")
+    st.plotly_chart(fig_ms, use_container_width=True)
+
+    # table ---------------------------------------------------------------
+    mecs_df = pd.DataFrame({
+        "Pressure Bin": bin_labels,
+        "Mean Diameter (mm)": mean_diam.values,
+        "Selected Troughs": n_trough.values
+    })
+    st.subheader("Per-bin summary")
+    st.dataframe(mecs_df.style.format({"Mean Diameter (mm)": "{:.3f}"}), height=280)
+
+    # Excel payload -------------------------------------------------------
+    mech_sel_export = pd.DataFrame({
+        "Diastolic Pressure Bin": x_mid,
+        "Mean Carotid Diameter":  y_mid,
+        "Selected Troughs in Bin": wts,
+        "Slope":        [slope_s] + [""] * (len(x_mid) - 1),
+        "Intercept":    [intercept_s] + [""] * (len(x_mid) - 1),
+        "Weighted Correlation Coefficient (R)": [r_s] + [""] * (len(x_mid) - 1),
+        "Coefficient of Determination (R²)":    [r2_s] + [""] * (len(x_mid) - 1),
+    })
+    st.session_state["mech_arc_sel_df"] = mech_sel_export
